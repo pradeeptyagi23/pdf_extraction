@@ -5,10 +5,8 @@ echo "===================================================="
 echo "  OCR TASK & SPARE PART EXTRACTOR (Docker)"
 echo "===================================================="
 echo "PDF_PATH : ${PDF_PATH:-<not set>}"
-echo "PAGES    : ${PAGES:-5}"
 echo
 
-# If you kept the original script name (change this if needed)
 SCRIPT="extract_tasks_and_spares.py"
 
 if [ ! -f "/app/$SCRIPT" ]; then
@@ -17,17 +15,22 @@ if [ ! -f "/app/$SCRIPT" ]; then
   exit 1
 fi
 
-if [ ! -f "/data/$PDF_PATH" ]; then
-  echo "ERROR: PDF '/data/$PDF_PATH' not found."
-  echo "Did you mount your host directory to /data correctly?"
-  echo "Example: -v \"\$(pwd)\":/data"
+if [ -z "${PDF_PATH:-}" ]; then
+  echo "ERROR: PDF_PATH not set. Please pass -e PDF_PATH=... when running."
   exit 1
 fi
 
-echo "Running: python $SCRIPT --pdf \"/data/$PDF_PATH\" --pages $PAGES"
+if [ ! -f "/data/$PDF_PATH" ]; then
+  echo "ERROR: PDF '/data/$PDF_PATH' not found."
+  echo "Did you mount your host directory to /data correctly?"
+  echo "Example: -v \"\$(pwd -W)\":/data on Windows Git Bash"
+  exit 1
+fi
+
+echo "Running: python $SCRIPT --pdf \"/data/$PDF_PATH\""
 echo
 
-python "/app/$SCRIPT" --pdf "/data/$PDF_PATH" --pages "$PAGES"
+python "/app/$SCRIPT" --pdf "/data/$PDF_PATH"
 
 echo
 echo "===================================================="

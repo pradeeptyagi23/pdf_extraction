@@ -10,7 +10,7 @@ from pdf2image import convert_from_path
 from openpyxl import Workbook
 from PIL import ImageOps
 
-# More tolerant pattern for part-number-like strings
+# More tolerant pattern for part-number-like strings (handles "1550595-9960" etc.)
 PART_CANDIDATE_RE = re.compile(r"\d{4,}[- ]?\d{3,4}")
 
 
@@ -52,27 +52,25 @@ def configure_ocr_from_env() -> str | None:
     return poppler_path
 
 
-def pdf_to_text_lines(
-    pdf_path: Path,
-    first_page: int,
-    last_page: int | None,
-    poppler_path: str | None,
-):
-    """Convert a page range of PDF to text lines using OCR."""
+def pdf_to_text_lines(pdf_path: Path, poppler_path: str | None):
+    """
+    Convert the entire PDF to text lines using OCR.
+
+    We process all pages; task and spare-part detection is done purely
+    from content (no page ranges needed).
+    """
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     images = convert_from_path(
         str(pdf_path),
         dpi=300,
-        first_page=first_page,
-        last_page=last_page,
         poppler_path=poppler_path,
     )
 
     all_lines: list[str] = []
-    for page_num, img in enumerate(images, start=first_page):
-        print(f"OCR on page {page_num}...")
+    for i, img in enumerate(images, start=1):
+        print(f"OCR on page {i}...")
         gray = img.convert("L")
         enhanced = ImageOps.autocontrast(gray, cutoff=2)
         processed = enhanced.point(lambda x: 0 if x < 180 else 255, "1")
@@ -100,8 +98,7 @@ def pdf_to_text_lines(
         all_lines.extend(page_lines)
 
     # dump OCR text for debugging
-    suffix = f".ocr_{first_page}_to_{last_page or 'end'}_pages.txt"
-    dump_path = pdf_path.with_suffix(suffix)
+    dump_path = pdf_path.with_suffix(".ocr_all_pages.txt")
     dump_path.write_text("\n".join(all_lines), encoding="utf-8")
     print(f"OCR dump written to: {dump_path}")
 
@@ -376,14 +373,11 @@ def build_workbook(task_rows: list[dict], spare_rows: list[dict]) -> Workbook:
     return wb
 
 
-def extract_tasks_and_assets(
-    pdf_path: Path, max_pages: int, poppler_path: str | None
-):
-    lines = pdf_to_text_lines(
-        pdf_path, first_page=1, last_page=max_pages, poppler_path=poppler_path
-    )
-
-    print("Parsing task lines...")
+def extract_tasks_and_assets_from_lines(lines: list[str]):
+    """
+    Scan all OCR lines and extract task rows + asset context.
+    """
+    print("Parsing task lines across entire document...")
     rows: list[dict] = []
     rows_by_code: dict[str, dict] = {}
     current_location1 = ""
@@ -593,16 +587,18 @@ def parse_part_block(lines: list[str], idx: int):
     )
 
 
-def extract_spare_parts(
-    pdf_path: Path,
-    start_page: int,
-    poppler_path: str | None,
+def extract_spare_parts_from_lines(
+    lines: list[str],
     task_lookup: dict[str, dict],
 ):
-    lines = pdf_to_text_lines(
-        pdf_path, first_page=start_page, last_page=None, poppler_path=poppler_path
-    )
-    print("Parsing spare part lines...")
+    """
+    Scan all OCR lines and extract spare-part rows.
+
+    Because we pass the complete task_lookup (built from the same full
+    lines list), this works even if spare parts appear before the task
+    rows in the PDF: the TaskCode references will still match tasks.
+    """
+    print("Parsing spare part lines across entire document...")
     spare_rows: list[dict] = []
     current_task_code = ""
     current_location1 = ""
@@ -632,6 +628,7 @@ def extract_spare_parts(
 
             task_code = parsed.get("TaskCode") or current_task_code or ""
             if not task_code:
+                # If we don't have a task code at all, we can't map it properly.
                 continue
 
             task_ctx = task_lookup.get(task_code, {})
@@ -698,37 +695,34 @@ def main():
         help="Path to input PDF file.",
     )
     parser.add_argument(
-        "--pages",
-        type=int,
-        default=5,
-        help="Number of pages from the start of the PDF to process for tasks (default: 5).",
-    )
-    parser.add_argument(
         "--out",
-        help="Output XLSX path. Defaults to <pdf_stem>_first_<pages>_pages.xlsx",
+        help="Output XLSX path. Defaults to <pdf_stem>_tasks_spares.xlsx",
     )
 
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
-    max_pages = args.pages
 
     if args.out:
         output_xlsx = Path(args.out)
     else:
-        output_xlsx = pdf_path.with_name(f"{pdf_path.stem}_first_{max_pages}_pages.xlsx")
+        output_xlsx = pdf_path.with_name(f"{pdf_path.stem}_tasks_spares.xlsx")
 
     poppler_path = configure_ocr_from_env()
     print(f"Using POPPLER_PATH={poppler_path!r}")
-    print("Reading and OCR'ing PDF...")
+    print("Reading and OCR'ing entire PDF...")
 
-    task_rows, task_lookup, asset_type, asset_code = extract_tasks_and_assets(
-        pdf_path, max_pages, poppler_path
+    # Single OCR pass over entire document
+    lines = pdf_to_text_lines(pdf_path, poppler_path)
+
+    # First pass: tasks (so task_lookup is complete)
+    task_rows, task_lookup, asset_type, asset_code = extract_tasks_and_assets_from_lines(
+        lines
     )
-    spare_rows = extract_spare_parts(
-        pdf_path,
-        start_page=max_pages + 1,
-        poppler_path=poppler_path,
+
+    # Second pass: spare parts (can safely reference tasks, even if parts appear before them)
+    spare_rows = extract_spare_parts_from_lines(
+        lines,
         task_lookup=task_lookup,
     )
 
