@@ -11,6 +11,7 @@ WORKDIR /app
 # Copy your project files into the image
 COPY extract_tasks_and_spares.py /app/
 COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Install Python dependencies (no OCR libs needed)
 RUN pip install --no-cache-dir \

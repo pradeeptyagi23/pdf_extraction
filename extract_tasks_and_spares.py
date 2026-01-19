@@ -195,74 +195,51 @@ def parse_task_row(full_line: str):
 
     task_code, trade, task_action = tokens[0], tokens[1], tokens[2]
     rest = " ".join(tokens[3:]).strip()
+    # Normalize missing space before "No Interval" (e.g., "...00361No Interval")
+    rest = re.sub(r"(?i)(?<!\s)(no\s+interval)", r" \1", rest)
+    # Normalize missing space between serials and DocRef (e.g., "...00327" + "4.2.5.1-3")
+    rest = re.sub(r"([0-9]/[0-9]{3,})(\d+\.\d+.*-\d+)", r"\1 \2", rest)
 
-    # Pattern 1: description + 'No reference 1000 Hours'
-    m = re.search(
-        r"^(?P<desc>.*)\bNo reference\b\s+(?P<num>\d+)\s+(?P<unit>Hours?|Weeks?|Months?|Days?)\b$",
-        rest,
-    )
-    if m:
-        desc = m.group("desc").strip()
-        return task_code, trade, task_action, desc, "No reference", f"{m.group('num')} {m.group('unit')}"
+    interval = ""
+    m_no = re.search(r"(?i)\bno\s+interval\s*$", rest)
+    if m_no:
+        interval = "No Interval"
+        rest = rest[: m_no.start()].rstrip()
+    else:
+        m_int = re.search(r"(\d+(?:\.\d+)?)\s+(Hours?|Weeks?|Months?|Days?)\s*$", rest, flags=re.IGNORECASE)
+        if m_int:
+            interval = f"{m_int.group(1)} {m_int.group(2)}"
+            rest = rest[: m_int.start()].rstrip()
 
-    # Pattern 2: description + DOCREF + '1000 Hours'
-    m = re.search(
-        r"^(?P<desc>.*)\s(?P<doc>[A-Z0-9./-]{1,10})\s+(?P<num>\d+)\s+(?P<unit>Hours?|Weeks?|Months?|Days?)\b$",
-        rest,
-    )
-    if m:
-        desc = m.group("desc").strip()
-        doc_ref = m.group("doc").strip()
-        return task_code, trade, task_action, desc, doc_ref, f"{m.group('num')} {m.group('unit')}"
+    body = rest.split()
 
-    # Pattern 3: description + DOCREF + 'No Interval'
-    m = re.search(
-        r"^(?P<desc>.*)\s(?P<doc>[A-Z0-9./-]{1,10})\s+No Interval$",
-        rest,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        desc = m.group("desc").strip()
-        doc_ref = m.group("doc").strip()
-        return task_code, trade, task_action, desc, doc_ref, "No Interval"
+    if not body:
+        return task_code, trade, task_action, "", "", interval
 
-    # Fallback: best-effort split
-    remaining_tokens = rest.split()
+    lowers = [t.lower() for t in body]
+    for i in range(len(body) - 1):
+        if lowers[i] == "no" and lowers[i + 1] == "reference":
+            desc = " ".join(body[:i]).strip()
+            return task_code, trade, task_action, desc, "No reference", interval
 
-    def _split_interval(tokens):
-        if not tokens:
-            return [], ""
-        lowers = [t.lower() for t in tokens]
-        if len(tokens) >= 2 and lowers[-2:] == ["no", "interval"]:
-            return tokens[:-2], "No Interval"
-        if (
-            lowers[-1] in {"hours", "hour", "week", "weeks", "month", "months", "day", "days"}
-            and len(tokens) >= 2
-            and re.fullmatch(r"\d+", tokens[-2])
-        ):
-            return tokens[:-2], f"{tokens[-2]} {tokens[-1]}"
-        return tokens, ""
+    def is_allowed_docref(tok: str) -> bool:
+        if "/" in tok:
+            return False  # serial-like, keep in description
+        if re.fullmatch(r"[A-Z]{2,8}", tok):
+            return True
+        if re.fullmatch(r"\d+(?:\.\d+)*-\d+", tok):
+            return True
+        return False
 
-    def _split_doc_ref_and_desc(tokens):
-        if not tokens:
-            return "", ""
-        lowers = [t.lower() for t in tokens]
-        # 'No reference' anywhere near the end
-        for i in range(len(tokens) - 1):
-            if lowers[i] == "no" and lowers[i + 1] == "reference":
-                return " ".join(tokens[:i]).strip(), "No reference"
-        # Otherwise, doc ref is trailing upper-case / numeric chunk
-        lookback = tokens[-5:] if len(tokens) > 5 else tokens
-        start = len(tokens) - 1
-        for offset, tok in enumerate(lookback):
-            if re.search(r"\d", tok) or re.search(r"[:;/.\-]", tok) or (tok.isupper() and len(tok) <= 4):
-                start = len(tokens) - len(lookback) + offset
-                break
-        return " ".join(tokens[:start]).strip(), " ".join(tokens[start:]).strip()
+    # Only consume the very last token as DocRef if it is allowed
+    if body and is_allowed_docref(body[-1]):
+        desc_tokens = body[:-1]
+        doc_ref = body[-1]
+        desc = " ".join(desc_tokens).strip()
+        return task_code, trade, task_action, desc, doc_ref, interval
 
-    body, interval = _split_interval(remaining_tokens)
-    desc, doc_ref = _split_doc_ref_and_desc(body)
-    return task_code, trade, task_action, desc, doc_ref, interval
+    # Otherwise, leave everything in description
+    return task_code, trade, task_action, " ".join(body).strip(), "", interval
 
 
 def looks_like_part_line(line: str) -> bool:
