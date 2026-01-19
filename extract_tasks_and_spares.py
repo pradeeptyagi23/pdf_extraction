@@ -57,7 +57,15 @@ def is_spares_header_line(line: str) -> bool:
     'Part No Part Description Task Code Task Action Component Tree Path Qty Required Unit Of Measure'
     """
     lower = " ".join(line.lower().split())
-    return "part no" in lower and "task code" in lower and "qty required" in lower
+    squashed = lower.replace(" ", "")
+
+    has_part_no = ("part no" in lower) or ("partno" in squashed)
+    has_part_desc = ("part description" in lower) or ("partdescription" in squashed)
+    has_task_code = ("task code" in lower) or ("taskcode" in squashed)
+    has_task_action = ("task action" in lower) or ("taskaction" in squashed)
+    has_qty_required = ("qty required" in lower) or ("qtyrequired" in squashed)
+
+    return has_part_no and has_part_desc and has_task_code and has_task_action and has_qty_required
 
 
 def is_metadata_line(line: str) -> bool:
@@ -65,7 +73,12 @@ def is_metadata_line(line: str) -> bool:
     Filter out page/meta lines.
     """
     low = line.lower().strip()
-    return low.startswith("database:") or low.startswith("printed by") or low.startswith("page ")
+    return (
+        low.startswith("database:")
+        or low.startswith("printed by")
+        or low.startswith("page ")
+        or "tetra pak internal" in low  # footer
+    )
 
 
 def parse_asset_line(line: str) -> Tuple[str, str]:
@@ -84,10 +97,18 @@ def looks_like_component_line(line: str) -> bool:
     """
     Grey rows with component / location info:
     e.g. '1 Pre-Maintenance Checks: (9000171371) ... \ [648575-0400] ...'
+
+    IMPORTANT: do NOT treat spare-part rows (which start with '1234567-0000')
+    as component rows.
     """
     stripped = line.strip()
     if not stripped:
         return False
+
+    # Spare-part rows start with a part number like '1036615-0000'
+    if re.match(r"^\d{5,}-\d{3,}\b", stripped):
+        return False
+
     if "\\" in line or "[" in line or stripped.startswith("("):
         return True
     if re.match(r"^\(\d{6,}-\d{4,}:", stripped):
@@ -246,7 +267,7 @@ def looks_like_part_line(line: str) -> bool:
     """
     Detect a spare part row by the '1234567-0000' style part number.
     """
-    return bool(re.search(r"\b\d{6,}-\d{3,}\b", line))
+    return bool(re.match(r"^\d{5,}-\d{3,}\b", line.strip()))
 
 
 def gather_part_block(lines: List[str], idx: int) -> Tuple[str, int]:
@@ -262,7 +283,10 @@ def gather_part_block(lines: List[str], idx: int) -> Tuple[str, int]:
         if not nxt.strip():
             i += 1
             continue
-        if is_spares_header_line(nxt) or is_metadata_line(nxt) or nxt.lower().startswith("asset:"):
+        if is_spares_header_line(nxt) or is_metadata_line(nxt):
+            break
+        low = nxt.lower().strip()
+        if low.startswith("asset:") or low.startswith("spares asset:"):
             break
         if looks_like_part_line(nxt) and i != idx:
             break
@@ -278,24 +302,21 @@ def parse_part_block(lines: List[str], idx: int):
     Returns (dict_or_None, next_index).
     """
     combined, next_idx = gather_part_block(lines, idx)
+    if not combined.strip():
+        return None, next_idx
+
     tokens = combined.split()
     if not tokens:
         return None, next_idx
 
     # Part number
-    part_idx = None
-    for j, tok in enumerate(tokens):
-        if re.fullmatch(r"\d{6,}-\d{3,}", tok):
-            part_idx = j
-            break
-    if part_idx is None:
+    if not re.fullmatch(r"\d{5,}-\d{3,}", tokens[0]):
         return None, next_idx
-
-    part_no = tokens[part_idx]
+    part_no = tokens[0]
 
     # Task code
     task_idx = None
-    for j in range(part_idx + 1, len(tokens)):
+    for j in range(1, len(tokens)):
         if re.fullmatch(r"\*?\d{6,8}", tokens[j]):
             task_idx = j
             break
@@ -303,10 +324,7 @@ def parse_part_block(lines: List[str], idx: int):
     task_code = normalize_task_code(tokens[task_idx]) if task_idx is not None else ""
     task_action = tokens[task_idx + 1] if task_idx is not None and task_idx + 1 < len(tokens) else ""
 
-    # Part description (between part number and task code)
-    desc_tokens = tokens[part_idx + 1 : task_idx if task_idx else len(tokens)]
-
-    # Component path + qty + UOM (after task action)
+    desc_tokens = tokens[1 : task_idx if task_idx else len(tokens)]
     comp_tokens = tokens[(task_idx + 2) if task_idx is not None else len(tokens) :]
 
     uom = ""
@@ -453,85 +471,87 @@ def extract_spares_from_lines(lines: List[str], task_lookup: Dict[str, Dict]):
     context (TaskCode, locations, setTypeCode) whenever possible.
     """
     spare_rows = []
-    current_task_code = ""
-    current_loc1 = ""
-    current_loc2 = ""
-    current_setcode = ""
-    current_comppath = ""
     seen_keys = set()
 
-    i = 0
-    n = len(lines)
+    # Find all spares header indices
+    header_indices = [i for i, ln in enumerate(lines) if is_spares_header_line(ln)]
+    if not header_indices:
+        return spare_rows
 
-    while i < n:
-        ln = lines[i]
+    for idx, header_idx in enumerate(header_indices):
+        end = header_indices[idx + 1] if idx + 1 < len(header_indices) else len(lines)
 
-        if is_metadata_line(ln):
-            i += 1
-            continue
+        current_loc1 = ""
+        current_loc2 = ""
+        current_setcode = ""
+        current_comppath = ""
 
-        low = ln.lower()
-        if low.startswith("asset:"):
-            i += 1
-            continue
+        i = header_idx + 1
+        while i < end:
+            ln = lines[i]
 
-        if is_spares_header_line(ln):
-            i += 1
-            continue
-
-        if looks_like_component_line(ln):
-            current_loc1, current_loc2, current_setcode, current_comppath = parse_grey_row(ln)
-            i += 1
-            continue
-
-        if looks_like_task_row(ln):
-            code = normalize_task_code(strip_status_prefix(ln).split()[0])
-            current_task_code = code
-            i += 1
-            continue
-
-        if looks_like_part_line(ln):
-            parsed, next_i = parse_part_block(lines, i)
-            i = next_i
-            if not parsed:
+            if not ln.strip():
+                i += 1
                 continue
 
-            task_code = parsed.get("TaskCode") or current_task_code
-            if not task_code:
+            low = ln.lower()
+            if is_metadata_line(ln) or low.startswith("asset:") or low.startswith("spares asset:"):
+                i += 1
                 continue
 
-            task_ctx = task_lookup.get(task_code, {})
-            key = (task_code, parsed["PartNo"], parsed["PartDescription"])
-            if key in seen_keys:
+            if is_spares_header_line(ln):
+                i += 1
                 continue
-            seen_keys.add(key)
 
-            loc1 = current_loc1 or task_ctx.get("Location1", "")
-            loc2 = current_loc2 or task_ctx.get("Location2", "")
-            setcode = current_setcode or task_ctx.get("setTypeCode", "")
-            if not setcode:
-                matches = re.findall(r"\((\d+)\)", parsed.get("ComponentPath", ""))
-                if matches:
-                    setcode = matches[-1]
+            # IMPORTANT: detect spare part rows BEFORE treating anything as a component line
+            if looks_like_part_line(ln):
+                parsed, next_i = parse_part_block(lines, i)
+                i = next_i
+                if not parsed:
+                    continue
 
-            spare_rows.append(
-                {
-                    "TaskCode": task_code,
-                    "PartNo": parsed["PartNo"],
-                    "PartDescription": parsed["PartDescription"],
-                    "MU_TL": "",
-                    "QtyRequired": parsed["QtyRequired"],
-                    "UOM": parsed["UOM"],
-                    "ItemDependency": "",
-                    "Location1": loc1,
-                    "Location2": loc2,
-                    "AssetType": "",
-                    "AssetTypeCode": setcode,
-                }
-            )
-            continue
+                task_code = parsed.get("TaskCode")
+                if not task_code:
+                    continue
 
-        i += 1
+                task_ctx = task_lookup.get(task_code, {})
+                key = (task_code, parsed["PartNo"], parsed["PartDescription"])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                loc1 = current_loc1 or task_ctx.get("Location1", "")
+                loc2 = current_loc2 or task_ctx.get("Location2", "")
+                setcode = current_setcode or task_ctx.get("setTypeCode", "")
+                if not setcode:
+                    matches = re.findall(r"\((\d+)\)", parsed.get("ComponentPath", ""))
+                    if matches:
+                        setcode = matches[-1]
+
+                spare_rows.append(
+                    {
+                        "TaskCode": task_code,
+                        "PartNo": parsed["PartNo"],
+                        "PartDescription": parsed["PartDescription"],
+                        "MU_TL": "",
+                        "QtyRequired": parsed["QtyRequired"],
+                        "UOM": parsed["UOM"],
+                        "ItemDependency": "",
+                        "Location1": loc1,
+                        "Location2": loc2,
+                        "AssetType": "",
+                        "AssetTypeCode": setcode,
+                    }
+                )
+                continue
+
+            # Only component / location context lines reach here
+            if looks_like_component_line(ln):
+                current_loc1, current_loc2, current_setcode, current_comppath = parse_grey_row(ln)
+                i += 1
+                continue
+
+            i += 1
 
     return spare_rows
 
