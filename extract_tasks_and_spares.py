@@ -200,7 +200,6 @@ def gather_task_block(lines: List[str], idx: int) -> Tuple[str, int]:
 
     return " ".join(buf), i
 
-
 def parse_task_row(full_line: str):
     """
     Parse a full task row (possibly assembled from multiple lines).
@@ -216,33 +215,48 @@ def parse_task_row(full_line: str):
 
     task_code, trade, task_action = tokens[0], tokens[1], tokens[2]
     rest = " ".join(tokens[3:]).strip()
+
     # Normalize missing space before "No Interval" (e.g., "...00361No Interval")
     rest = re.sub(r"(?i)(?<!\s)(no\s+interval)", r" \1", rest)
     # Normalize missing space between serials and DocRef (e.g., "...00327" + "4.2.5.1-3")
     rest = re.sub(r"([0-9]/[0-9]{3,})(\d+\.\d+.*-\d+)", r"\1 \2", rest)
 
+    # --- Interval extraction (at the very end) ---
     interval = ""
     m_no = re.search(r"(?i)\bno\s+interval\s*$", rest)
     if m_no:
         interval = "No Interval"
         rest = rest[: m_no.start()].rstrip()
     else:
-        m_int = re.search(r"(\d+(?:\.\d+)?)\s+(Hours?|Weeks?|Months?|Days?)\s*$", rest, flags=re.IGNORECASE)
+        m_int = re.search(
+            r"(\d+(?:\.\d+)?)\s+(Hours?|Weeks?|Months?|Days?)\s*$",
+            rest,
+            flags=re.IGNORECASE,
+        )
         if m_int:
             interval = f"{m_int.group(1)} {m_int.group(2)}"
             rest = rest[: m_int.start()].rstrip()
 
+    # --- DocRef: special case 'No reference' anywhere before the interval ---
+    doc_ref = ""
+    m_doc_no = re.search(r"(?i)\bno\s+reference\b", rest)
+    if m_doc_no:
+        # Everything before 'No reference' is description
+        doc_ref = "No reference"
+        rest = rest[: m_doc_no.start()].rstrip()
+
     body = rest.split()
 
     if not body:
-        return task_code, trade, task_action, "", "", interval
+        # No description text left
+        return task_code, trade, task_action, "", doc_ref, interval
 
-    lowers = [t.lower() for t in body]
-    for i in range(len(body) - 1):
-        if lowers[i] == "no" and lowers[i + 1] == "reference":
-            desc = " ".join(body[:i]).strip()
-            return task_code, trade, task_action, desc, "No reference", interval
+    # If we already know DocRef is 'No reference', all remaining tokens are description
+    if doc_ref:
+        desc = " ".join(body).strip()
+        return task_code, trade, task_action, desc, doc_ref, interval
 
+    # Otherwise, we may have a short code DocRef like 'MM' or '4.2.5.1-3' at the end
     def is_allowed_docref(tok: str) -> bool:
         if "/" in tok:
             return False  # serial-like, keep in description
@@ -252,15 +266,17 @@ def parse_task_row(full_line: str):
             return True
         return False
 
-    # Only consume the very last token as DocRef if it is allowed
     if body and is_allowed_docref(body[-1]):
         desc_tokens = body[:-1]
         doc_ref = body[-1]
         desc = " ".join(desc_tokens).strip()
         return task_code, trade, task_action, desc, doc_ref, interval
 
-    # Otherwise, leave everything in description
-    return task_code, trade, task_action, " ".join(body).strip(), "", interval
+    # Fallback: everything is description, DocRef empty
+    desc = " ".join(body).strip()
+    return task_code, trade, task_action, desc, "", interval
+
+
 
 
 def looks_like_part_line(line: str) -> bool:
